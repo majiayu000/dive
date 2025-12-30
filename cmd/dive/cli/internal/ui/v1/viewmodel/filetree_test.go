@@ -399,6 +399,54 @@ func TestFileTreeHideTypeWithFilter(t *testing.T) {
 	runTestCase(t, vm, width, height, regex)
 }
 
+func TestFileTreeCursorClampingOnToggleHideDiffType(t *testing.T) {
+	// Test that cursor position is clamped when toggling file visibility
+	// This is a regression test for issue #543
+	vm := initializeTestViewModel(t)
+
+	width, height := 100, 100
+	vm.Setup(0, height)
+	vm.ShowAttributes = false
+
+	// Select a layer that has different diff types
+	err := vm.SetTreeByLayer(0, 0, 1, 7)
+	require.NoError(t, err, "unable to SetTreeByLayer")
+
+	err = vm.Update(nil, width, height)
+	require.NoError(t, err, "unable to update")
+
+	// Move cursor down significantly
+	initialVisibleSize := vm.ModelTree.VisibleSize()
+	targetPosition := initialVisibleSize / 2
+	for i := 0; i < targetPosition; i++ {
+		vm.CursorDown()
+	}
+	assert.Equal(t, targetPosition, vm.TreeIndex, "cursor should be at target position")
+
+	// Now hide unmodified files - this should significantly reduce visible items
+	vm.ToggleShowDiffType(filetree.Unmodified)
+	err = vm.Update(nil, width, height)
+	require.NoError(t, err, "unable to update after toggle")
+
+	newVisibleSize := vm.ModelTree.VisibleSize()
+
+	// Verify cursor is clamped to valid range
+	if newVisibleSize == 0 {
+		assert.Equal(t, 0, vm.TreeIndex, "cursor should be 0 when no visible items")
+	} else {
+		assert.Less(t, vm.TreeIndex, newVisibleSize, "cursor should be within visible range")
+		assert.GreaterOrEqual(t, vm.TreeIndex, 0, "cursor should not be negative")
+	}
+
+	// Verify buffer indices are consistent
+	assert.GreaterOrEqual(t, vm.bufferIndex, 0, "bufferIndex should not be negative")
+	assert.GreaterOrEqual(t, vm.bufferIndexLowerBound, 0, "bufferIndexLowerBound should not be negative")
+
+	// Verify render works without panic
+	err = vm.Render()
+	require.NoError(t, err, "render should succeed after cursor clamping")
+}
+
 func repoPath(t testing.TB, path string) string {
 	t.Helper()
 	root := repoRoot(t)

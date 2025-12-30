@@ -445,6 +445,27 @@ func (vm *FileTreeViewModel) Update(filterRegex *regexp.Regexp, width, height in
 		return fmt.Errorf("unable to propagate vm view tree: %w", err)
 	}
 
+	// Clamp cursor position to visible range after visibility changes
+	visibleSize := vm.ModelTree.VisibleSize()
+	if visibleSize == 0 {
+		vm.TreeIndex = 0
+		vm.bufferIndex = 0
+		vm.bufferIndexLowerBound = 0
+	} else if vm.TreeIndex >= visibleSize {
+		vm.TreeIndex = visibleSize - 1
+		// Adjust buffer position to keep cursor in view
+		if vm.TreeIndex < vm.bufferIndexLowerBound {
+			vm.bufferIndexLowerBound = vm.TreeIndex
+			vm.bufferIndex = 0
+		} else {
+			vm.bufferIndex = vm.TreeIndex - vm.bufferIndexLowerBound
+			if vm.bufferIndex > vm.height() {
+				vm.bufferIndex = vm.height()
+				vm.bufferIndexLowerBound = vm.TreeIndex - vm.height()
+			}
+		}
+	}
+
 	return nil
 }
 
