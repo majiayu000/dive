@@ -2,16 +2,15 @@ package view
 
 import (
 	"fmt"
-	"github.com/anchore/go-logger"
-	"github.com/wagoodman/dive/cmd/dive/cli/internal/ui/v1/format"
-	"github.com/wagoodman/dive/cmd/dive/cli/internal/ui/v1/key"
-	"github.com/wagoodman/dive/internal/log"
 	"strconv"
-	"strings"
 
+	"github.com/anchore/go-logger"
 	"github.com/awesome-gocui/gocui"
 	"github.com/dustin/go-humanize"
+	"github.com/wagoodman/dive/cmd/dive/cli/internal/ui/v1/format"
+	"github.com/wagoodman/dive/cmd/dive/cli/internal/ui/v1/key"
 	"github.com/wagoodman/dive/dive/filetree"
+	"github.com/wagoodman/dive/internal/log"
 )
 
 type ImageDetails struct {
@@ -25,6 +24,9 @@ type ImageDetails struct {
 	efficiency     float64
 	inefficiencies filetree.EfficiencySlice
 	kb             key.Bindings
+
+	cursorIndex int
+	lineCount   int
 }
 
 func (v *ImageDetails) Name() string {
@@ -37,8 +39,8 @@ func (v *ImageDetails) Setup(body, header *gocui.View) error {
 
 	v.body = body
 	v.body.Editable = false
-	v.body.Wrap = true
-	v.body.Highlight = true
+	v.body.Wrap = false
+	v.body.Highlight = false
 	v.body.Frame = false
 
 	v.header = header
@@ -80,15 +82,16 @@ func (v *ImageDetails) Setup(body, header *gocui.View) error {
 // 2. the estimated wasted image space
 // 3. a list of inefficient file allocations
 func (v *ImageDetails) Render() error {
-	analysisTemplate := "%5s  %12s  %-s\n"
-	inefficiencyReport := fmt.Sprintf(format.Header(analysisTemplate), "Count", "Total Space", "Path")
+	analysisTemplate := "%5s  %12s  %-s"
+	inefficiencyHeader := fmt.Sprintf(format.Header(analysisTemplate), "Count", "Total Space", "Path")
 
 	var wastedSpace int64
+	var inefficiencyLines []string
 	for idx := 0; idx < len(v.inefficiencies); idx++ {
 		data := v.inefficiencies[len(v.inefficiencies)-1-idx]
 		wastedSpace += data.CumulativeSize
 
-		inefficiencyReport += fmt.Sprintf(analysisTemplate, strconv.Itoa(len(data.Nodes)), humanize.Bytes(uint64(data.CumulativeSize)), data.Path)
+		inefficiencyLines = append(inefficiencyLines, fmt.Sprintf(analysisTemplate, strconv.Itoa(len(data.Nodes)), humanize.Bytes(uint64(data.CumulativeSize)), data.Path))
 	}
 
 	imageNameStr := fmt.Sprintf("%s %s", format.Header("Image name:"), v.imageName)
@@ -96,8 +99,30 @@ func (v *ImageDetails) Render() error {
 	efficiencyStr := fmt.Sprintf("%s %d %%", format.Header("Image efficiency score:"), int(100.0*v.efficiency))
 	wastedSpaceStr := fmt.Sprintf("%s %s", format.Header("Potential wasted space:"), humanize.Bytes(uint64(wastedSpace)))
 
+	// Build all lines as a slice for proper line counting
+	var lines = []string{
+		imageNameStr,
+		imageSizeStr,
+		wastedSpaceStr,
+		efficiencyStr,
+		" ", // to avoid an empty line so CursorDown can work as expected
+		inefficiencyHeader,
+	}
+	lines = append(lines, inefficiencyLines...)
+
+	// Update line count for cursor bounds checking
+	v.lineCount = len(lines)
+
+	// Ensure cursor index is within bounds
+	if v.cursorIndex >= v.lineCount {
+		v.cursorIndex = v.lineCount - 1
+	}
+	if v.cursorIndex < 0 {
+		v.cursorIndex = 0
+	}
+
 	v.gui.Update(func(g *gocui.Gui) error {
-		width, _ := v.body.Size()
+		width, height := v.body.Size()
 
 		imageHeaderStr := format.RenderHeader("Image Details", width, v.gui.CurrentView() == v.body)
 
@@ -107,21 +132,33 @@ func (v *ImageDetails) Render() error {
 			log.WithFields("error", err).Debug("unable to write to buffer")
 		}
 
-		var lines = []string{
-			imageNameStr,
-			imageSizeStr,
-			wastedSpaceStr,
-			efficiencyStr,
-			" ", // to avoid an empty line so CursorDown can work as expected
-			inefficiencyReport,
+		v.body.Clear()
+		for idx, line := range lines {
+			if idx == v.cursorIndex {
+				_, err = fmt.Fprintln(v.body, format.Selected(line))
+			} else {
+				_, err = fmt.Fprintln(v.body, line)
+			}
+			if err != nil {
+				log.WithFields("error", err).Debug("unable to write to buffer")
+			}
 		}
 
-		v.body.Clear()
-		_, err = fmt.Fprintln(v.body, strings.Join(lines, "\n"))
-		if err != nil {
-			log.WithFields("error", err).Debug("unable to write to buffer")
+		// Adjust origin to keep cursor visible
+		if height > 0 {
+			maxVisibleIdx := height - 1
+			if v.cursorIndex > maxVisibleIdx {
+				if err := v.body.SetOrigin(0, v.cursorIndex-maxVisibleIdx); err != nil {
+					v.logger.WithFields("error", err).Debug("unable to set origin")
+				}
+			} else {
+				if err := v.body.SetOrigin(0, 0); err != nil {
+					v.logger.WithFields("error", err).Debug("unable to reset origin")
+				}
+			}
 		}
-		return err
+
+		return nil
 	})
 
 	return nil
@@ -141,30 +178,45 @@ func (v *ImageDetails) IsVisible() bool {
 
 func (v *ImageDetails) PageUp() error {
 	_, height := v.body.Size()
-	if err := CursorStep(v.gui, v.body, -height); err != nil {
-		v.logger.WithFields("error", err).Debugf("couldn't move the cursor up by %d steps", height)
+	newIndex := v.cursorIndex - height
+	if newIndex < 0 {
+		newIndex = 0
+	}
+	if newIndex != v.cursorIndex {
+		v.cursorIndex = newIndex
+		return v.Render()
 	}
 	return nil
 }
 
 func (v *ImageDetails) PageDown() error {
 	_, height := v.body.Size()
-	if err := CursorStep(v.gui, v.body, height); err != nil {
-		v.logger.WithFields("error", err).Debugf("couldn't move the cursor down by %d steps", height)
+	newIndex := v.cursorIndex + height
+	if newIndex >= v.lineCount {
+		newIndex = v.lineCount - 1
+	}
+	if newIndex < 0 {
+		newIndex = 0
+	}
+	if newIndex != v.cursorIndex {
+		v.cursorIndex = newIndex
+		return v.Render()
 	}
 	return nil
 }
 
 func (v *ImageDetails) CursorUp() error {
-	if err := CursorUp(v.gui, v.body); err != nil {
-		v.logger.WithFields("error", err).Debug("couldn't move the cursor up")
+	if v.cursorIndex > 0 {
+		v.cursorIndex--
+		return v.Render()
 	}
 	return nil
 }
 
 func (v *ImageDetails) CursorDown() error {
-	if err := CursorDown(v.gui, v.body); err != nil {
-		v.logger.WithFields("error", err).Debug("couldn't move the cursor down")
+	if v.cursorIndex < v.lineCount-1 {
+		v.cursorIndex++
+		return v.Render()
 	}
 	return nil
 }
